@@ -32,6 +32,8 @@ VOLUME_MULTIPLIER = 0.90
 STATE_FILE = "beelzebub_state.json"
 
 exchange = ccxt.kraken({
+    "apiKey": os.environ["KRAKEN_API_KEY"],
+    "secret": os.environ["KRAKEN_API_SECRET"],
     "enableRateLimit": True
 })
 

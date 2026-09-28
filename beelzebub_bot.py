@@ -220,6 +220,43 @@ def prepare_live_long(entry, stop, target, amount):
     }
 
 
+def build_bracket_plan(entry, stop, target, amount):
+    """Build a safe LONG bracket plan without submitting an order."""
+    if LIVE_ORDERS_ENABLED is not True:
+        return None
+
+    if entry <= 0 or stop <= 0 or target <= 0:
+        raise ValueError("Entry, stop, and target must be positive.")
+
+    if stop >= entry:
+        raise ValueError("LONG stop must be below entry.")
+
+    if target <= entry:
+        raise ValueError("LONG target must be above entry.")
+
+    if amount <= 0:
+        raise ValueError("Order amount must be positive.")
+
+    return {
+        "symbol": SYMBOL,
+        "side": "buy",
+        "amount": amount,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "protection": {
+            "stop_loss": {
+                "ordertype": "stop-loss",
+                "price": stop
+            },
+            "take_profit": {
+                "ordertype": "take-profit",
+                "price": target
+            }
+        }
+    }
+
+
 def manage_paper_position(state, candle):
     if not state["active"]:
         return False

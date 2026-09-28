@@ -202,6 +202,24 @@ def show_paper_position(state, current_price):
     )
 
 
+def prepare_live_long(entry, stop, target, amount):
+    """Prepare live LONG parameters without submitting an order."""
+    if LIVE_ORDERS_ENABLED is not True:
+        print("")
+        print("LIVE EXECUTION: DISABLED")
+        print("No live order submitted.")
+        return None
+
+    return {
+        "symbol": SYMBOL,
+        "side": "buy",
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "amount": amount
+    }
+
+
 def manage_paper_position(state, candle):
     if not state["active"]:
         return False

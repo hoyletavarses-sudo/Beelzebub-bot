@@ -47,6 +47,10 @@ def load_state():
         "target": None,
         "amount": 0.0,
         "entry_time": None,
+        "entry_order_id": None,
+        "stop_order_id": None,
+        "target_order_id": None,
+        "live_mode": False,
         "paper_pnl": 0.0,
         "trades": 0,
         "wins": 0,
@@ -160,6 +164,10 @@ def clear_position(state):
     state["target"] = None
     state["amount"] = 0.0
     state["entry_time"] = None
+    state["entry_order_id"] = None
+    state["stop_order_id"] = None
+    state["target_order_id"] = None
+    state["live_mode"] = False
 
 
 def show_paper_position(state, current_price):

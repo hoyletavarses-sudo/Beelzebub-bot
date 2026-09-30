@@ -29,7 +29,7 @@ SMA_SLOW = 50
 RSI_PERIOD = 14
 RSI_THRESHOLD = 50
 VOLUME_PERIOD = 20
-VOLUME_MULTIPLIER = 0.85
+VOLUME_MULTIPLIER = 0.90
 R_MULTIPLE = 2.0
 
 STATE_FILE = "beelzebub_state.json"
@@ -203,7 +203,6 @@ def set_waiting_for_fill(
         raise ValueError("Entry side must be LONG or SHORT.")
 
     state["active"] = False
-    state["entry_pending"] = True
     state["side"] = side
     state["entry"] = None
     state["stop"] = None
@@ -263,7 +262,6 @@ def activate_confirmed_entry(state, fill_result, stop, target):
             raise ValueError("SHORT target must be below actual fill price.")
 
     state["active"] = True
-    state["entry_pending"] = False
     state["entry"] = average_price
     state["stop"] = stop
     state["target"] = target
@@ -276,13 +274,10 @@ def activate_confirmed_entry(state, fill_result, stop, target):
     return state
 
 
-def set_protection_order_ids(state, stop_order_id, target_order_id=None):
-    """Record the single native trailing-stop protection order."""
-
+def set_protection_order_ids(state, stop_order_id, target_order_id):
+    """Record both protection order IDs after a confirmed active entry."""
     if not state.get("active"):
-        raise ValueError(
-            "Position must be active before protection is recorded."
-        )
+        raise ValueError("Position must be active before protection is recorded.")
 
     if not state.get("entry_order_id"):
         raise ValueError("Entry order ID is required.")
@@ -293,20 +288,23 @@ def set_protection_order_ids(state, stop_order_id, target_order_id=None):
         )
 
     if not stop_order_id:
-        raise ValueError(
-            "Trailing-stop order ID is required."
-        )
+        raise ValueError("Stop-loss order ID is required.")
+
+    if not target_order_id:
+        raise ValueError("Take-profit order ID is required.")
+
+    if stop_order_id == target_order_id:
+        raise ValueError("Stop-loss and take-profit IDs must be different.")
 
     state["stop_order_id"] = stop_order_id
-    state["target_order_id"] = None
+    state["target_order_id"] = target_order_id
     state["protection_pending"] = False
 
     return state
 
 
 def protection_orders_confirmed(state):
-    """Return True when an active position has its trailing-stop protection."""
-
+    """Return True only when an active LONG or SHORT has both protection IDs."""
     if not state.get("active"):
         return False
 
@@ -319,7 +317,11 @@ def protection_orders_confirmed(state):
     if not state.get("stop_order_id"):
         return False
 
+    if not state.get("target_order_id"):
+        return False
+
     return True
+
 
 
 def classify_entry_fill(order, requested_qty):
@@ -594,34 +596,6 @@ def get_authenticated_open_orders_v1():
         ws.close()
 
 
-def get_authenticated_order_history_v1(order_id):
-    """Read one Kraken order from authenticated QueryOrders. Read-only."""
-
-    if not order_id:
-        raise ValueError("Order ID is required.")
-
-    response = exchange.privatePostQueryOrders({
-        "txid": order_id,
-        "trades": True
-    })
-
-    result = response.get("result", {})
-
-    if not isinstance(result, dict):
-        raise RuntimeError(
-            "Kraken QueryOrders returned an invalid result."
-        )
-
-    order = result.get(order_id)
-
-    if order is None:
-        raise RuntimeError(
-            f"Kraken QueryOrders did not return order {order_id}."
-        )
-
-    return order
-
-
 def normalize_open_order_v1(order_id, order_data):
     """Normalize one Kraken v1 openOrders record."""
 
@@ -784,11 +758,10 @@ def validate_kraken_v2_protection_request(request):
 
     if params.get("order_type") not in (
         "stop-loss",
-        "take-profit",
-        "trailing-stop"
+        "take-profit"
     ):
         raise ValueError(
-            "Unsupported protection order type."
+            "Only stop-loss and take-profit validation is allowed."
         )
 
     if params.get("side") not in ("buy", "sell"):
@@ -1236,8 +1209,7 @@ def submit_kraken_v2_protection_pair(
 
 
 def establish_live_protection(state):
-    """Submit and verify one native 0.25% trailing-stop protection order."""
-
+    """Submit and verify live protection for an active LONG position."""
     if not state.get("active"):
         return {
             "status": "NO_ACTIVE_POSITION",
@@ -1273,114 +1245,60 @@ def establish_live_protection(state):
     try:
         requests = build_kraken_v2_protection_requests(
             state,
-            state.get("stop", 0),
-            state.get("target", 0),
+            state["stop"],
+            state["target"],
             entry_order_id
         )
 
-        trailing_request = requests["trailing_stop"]
-
-        submission = submit_kraken_v2_protection_request(
-            trailing_request
+        submission = submit_kraken_v2_protection_pair(
+            requests["stop_loss"],
+            requests["take_profit"]
         )
 
         if not submission:
             return {
                 "status": "PROTECTION_HALTED",
-                "reason": "Trailing-stop submission returned no result.",
+                "reason": "Protection submission returned no result.",
                 "state": state
             }
 
-        if submission.get("success") is not True:
+        if submission.get("status") != "BOTH_SUBMITTED":
             return {
                 "status": "PROTECTION_HALTED",
                 "reason": submission.get(
                     "error",
-                    "Trailing-stop submission failed."
+                    "Protection pair was not fully submitted."
                 ),
-                "submission": submission,
+                "submission_status": submission.get("status"),
+                "stop": submission.get("stop"),
+                "target": submission.get("target"),
                 "state": state
             }
 
-        trailing_order_id = submission.get("order_id")
+        stop_order_id = submission["stop"]["order_id"]
+        target_order_id = submission["target"]["order_id"]
 
-        if not trailing_order_id:
-            return {
-                "status": "PROTECTION_HALTED",
-                "reason": "Kraken did not return a trailing-stop order ID.",
-                "submission": submission,
-                "state": state
-            }
-
-        verified_order = get_authenticated_order_history_v1(
-            trailing_order_id
+        verification = verify_protection_pair(
+            stop_order_id,
+            target_order_id,
+            state["amount"],
+            state["stop"],
+            state["target"],
+            state["entry_order_id"],
+            position_side=state["side"]
         )
 
-        if not verified_order:
+        if verification.get("status") != "VERIFIED":
             return {
                 "status": "PROTECTION_HALTED",
-                "reason": "Trailing-stop order could not be verified.",
-                "order_id": trailing_order_id,
-                "state": state
-            }
-
-        order_status = verified_order.get("status")
-
-        if order_status not in ("open", "pending"):
-            return {
-                "status": "PROTECTION_HALTED",
-                "reason": (
-                    "Trailing-stop order was returned with an unexpected "
-                    f"status: {order_status}"
-                ),
-                "order_id": trailing_order_id,
-                "order": verified_order,
-                "state": state
-            }
-
-        expected_side = (
-            "sell"
-            if state.get("side") == "LONG"
-            else "buy"
-        )
-
-        actual_side = (
-            verified_order.get("descr", {})
-            .get("type")
-        )
-
-        if actual_side != expected_side:
-            return {
-                "status": "PROTECTION_HALTED",
-                "reason": (
-                    f"Trailing-stop side mismatch. "
-                    f"Expected {expected_side}, got {actual_side}."
-                ),
-                "order_id": trailing_order_id,
-                "order": verified_order,
-                "state": state
-            }
-
-        actual_quantity = float(
-            verified_order.get("vol", 0) or 0
-        )
-
-        if abs(actual_quantity - float(state["amount"])) > 1e-8:
-            return {
-                "status": "PROTECTION_HALTED",
-                "reason": (
-                    "Trailing-stop quantity mismatch. "
-                    f"Expected {state['amount']}, "
-                    f"got {actual_quantity}."
-                ),
-                "order_id": trailing_order_id,
-                "order": verified_order,
+                "reason": "Protection verification did not return VERIFIED.",
                 "state": state
             }
 
         state = set_protection_order_ids(
             state,
-            trailing_order_id
+            stop_order_id,
+            target_order_id
         )
 
         save_state(state)
@@ -1388,18 +1306,14 @@ def establish_live_protection(state):
         if not protection_orders_confirmed(state):
             return {
                 "status": "PROTECTION_HALTED",
-                "reason": (
-                    "Trailing-stop state failed final confirmation."
-                ),
+                "reason": "Protection state failed final confirmation.",
                 "state": state
             }
 
         return {
             "status": "PROTECTION_ESTABLISHED",
-            "protection_type": "TRAILING_STOP",
-            "trailing_stop_order_id": trailing_order_id,
             "state": state,
-            "verification": verified_order
+            "verification": verification
         }
 
     except Exception as exc:
@@ -1575,61 +1489,98 @@ def build_kraken_v2_protection_requests(
     target,
     entry_order_id
 ):
-    """Build one native 0.25% Kraken trailing-stop protection order."""
-
+    """Build Kraken WebSocket v2 protection requests without submitting them."""
     if not entry_order_id:
         raise ValueError(
-            "Entry order ID is required for protection."
+            "Entry order ID is required for protection IDs."
         )
 
     if not position:
         raise ValueError("Position data is required.")
 
-    position_side = position.get("side")
+    position_side = position.get("side", "LONG")
 
     if position_side not in ("LONG", "SHORT"):
         raise ValueError(
             "Position side must be LONG or SHORT."
         )
 
-    quantity = float(position.get("amount", 0))
-    entry = float(position.get("entry", 0))
+    quantity = position.get("amount", 0)
+    entry = position.get("entry", 0)
 
     if quantity <= 0:
-        raise ValueError(
-            "Protection quantity must be positive."
-        )
+        raise ValueError("Protection quantity must be positive.")
 
     if entry <= 0:
+        raise ValueError("Actual entry price must be positive.")
+
+    if stop <= 0 or target <= 0:
         raise ValueError(
-            "Actual entry price must be positive."
+            "Protection prices must be positive."
         )
 
-    protection_side = (
-        "sell"
-        if position_side == "LONG"
-        else "buy"
-    )
+    if position_side == "LONG":
+        if stop >= entry:
+            raise ValueError(
+                "LONG stop must be below actual entry."
+            )
 
+        if target <= entry:
+            raise ValueError(
+                "LONG target must be above actual entry."
+            )
+
+        protection_side = "sell"
+
+    else:
+        if stop <= entry:
+            raise ValueError(
+                "SHORT stop must be above actual entry."
+            )
+
+        if target >= entry:
+            raise ValueError(
+                "SHORT target must be below actual entry."
+            )
+
+        protection_side = "buy"
+
+    exchange.load_markets()
+
+    # Kraken US margin (Bitnomial) routing symbol.
+    # CCXT 4.5.84 does not expose this market, so do not
+    # pass it through CCXT's market-dependent precision helpers.
+    protection_symbol = "XBT/USD:BTNL"
+
+    # Kraken Bitnomial BTC/USD rules:
+    # quantity: 8 decimal places
+    # price: 0.1 USD tick size
     order_quantity = float(f"{quantity:.8f}")
+    stop_price = round(float(stop), 1)
+    target_price = round(float(target), 1)
 
     if order_quantity <= 0:
         raise ValueError(
             "Formatted protection quantity is invalid."
         )
 
+    if stop_price <= 0 or target_price <= 0:
+        raise ValueError(
+            "Formatted protection price is invalid."
+        )
+
     return {
-        "trailing_stop": {
+        "stop_loss": {
             "method": "add_order",
             "params": {
-                "order_type": "trailing-stop",
+                "order_type": "stop-loss",
                 "side": protection_side,
                 "order_qty": order_quantity,
-                "symbol": "XBT/USD:BTNL",
+                "symbol": protection_symbol,
                 "triggers": {
-                    "reference": "index",
-                    "price": 0.25,
-                    "price_type": "pct"
+                    "reference": "last",
+                    "price": stop_price,
+                    "price_type": "static"
                 },
                 "cl_ord_id": protection_client_id(
                     "S",
@@ -1639,9 +1590,29 @@ def build_kraken_v2_protection_requests(
                 "reduce_only": True,
                 "validate": True
             }
+        },
+        "take_profit": {
+            "method": "add_order",
+            "params": {
+                "order_type": "take-profit",
+                "side": protection_side,
+                "order_qty": order_quantity,
+                "symbol": protection_symbol,
+                "triggers": {
+                    "reference": "last",
+                    "price": target_price,
+                    "price_type": "static"
+                },
+                "cl_ord_id": protection_client_id(
+                    "T",
+                    entry_order_id
+                ),
+                "margin": True,
+                "reduce_only": True,
+                "validate": True
+            }
         }
     }
-
 
 def build_live_protection_orders(
     position,
@@ -1855,8 +1826,6 @@ def process_waiting_entry(state, executions):
             risk_distance * R_MULTIPLE
         )
 
-    # Use the actual confirmed filled quantity and weighted-average
-    # fill price for the live position.
     state = activate_confirmed_entry(
         state,
         fill_result,
@@ -1955,7 +1924,6 @@ def confirm_entry_quantity(
 def load_state():
     default = {
         "active": False,
-        "entry_pending": False,
         "side": None,
         "entry": None,
         "stop": None,
@@ -2053,31 +2021,6 @@ def get_completed_candles():
     return candles[:-1]
 
 
-
-
-def position_size(entry, stop):
-    """Calculate BTC position size using risk and maximum position value caps."""
-
-    entry = float(entry)
-    stop = float(stop)
-
-    if entry <= 0:
-        return 0.0
-
-    risk_distance = abs(entry - stop)
-
-    if risk_distance <= 0:
-        return 0.0
-
-    risk_based_amount = MAX_RISK_USD / risk_distance
-    position_cap_amount = MAX_POSITION_USD / entry
-
-    amount = min(
-        risk_based_amount,
-        position_cap_amount
-    )
-
-    return max(amount, 0.0)
 
 
 def build_kraken_v2_margin_entry_request(side, entry, amount):
@@ -2342,208 +2285,6 @@ def submit_live_long_entry(entry, amount):
     finally:
         ws.close()
 
-
-def recover_live_position(state):
-    """Verify an existing live position and its native trailing-stop."""
-
-    if not state.get("active"):
-        return {
-            "status": "NO_ACTIVE_POSITION",
-            "state": state
-        }
-
-    if state.get("live_mode") is not True:
-        return {
-            "status": "NOT_LIVE_POSITION",
-            "state": state
-        }
-
-    required = (
-        "entry_order_id",
-        "stop_order_id",
-        "side",
-        "entry",
-        "amount",
-    )
-
-    for field in required:
-        if state.get(field) in (None, "", 0, 0.0):
-            return {
-                "status": "RECOVERY_HALTED",
-                "reason": f"Missing required state field: {field}"
-            }
-
-    if state.get("side") not in ("LONG", "SHORT"):
-        return {
-            "status": "RECOVERY_HALTED",
-            "reason": "Invalid live position side."
-        }
-
-    try:
-        entry = verify_live_order(
-            state["entry_order_id"]
-        )
-
-        if entry.get("symbol") != SYMBOL:
-            raise RuntimeError(
-                "Entry order has unexpected symbol."
-            )
-
-        expected_entry_side = (
-            "sell" if state["side"] == "SHORT" else "buy"
-        )
-
-        if entry.get("side") != expected_entry_side:
-            raise RuntimeError(
-                f"Entry order side does not match {state['side']} position."
-            )
-
-        if entry.get("type") != "limit":
-            raise RuntimeError(
-                "Entry order is not a limit order."
-            )
-
-        if entry.get("status") != "closed":
-            raise RuntimeError(
-                "Entry order is not confirmed closed/filled."
-            )
-
-        filled = entry.get("filled")
-        if filled is None:
-            raise RuntimeError(
-                "Entry order is missing filled quantity."
-            )
-
-        if abs(filled - state["amount"]) > 1e-12:
-            raise RuntimeError(
-                "Entry filled quantity does not match saved position quantity."
-            )
-
-        average = entry.get("average")
-        if average is None:
-            raise RuntimeError(
-                "Entry order is missing average fill price."
-            )
-
-        if abs(average - state["entry"]) > 0.11:
-            raise RuntimeError(
-                "Entry average fill price does not match saved entry."
-            )
-
-        trailing_order = get_authenticated_order_history_v1(
-            state["stop_order_id"]
-        )
-
-        if not trailing_order:
-            return {
-                "status": "RECOVERY_HALTED",
-                "reason": "Trailing-stop order could not be verified."
-            }
-
-        trailing_status = trailing_order.get("status")
-
-        if trailing_status not in ("open", "pending"):
-            return {
-                "status": "RECOVERY_HALTED",
-                "reason": (
-                    "Trailing-stop order has unexpected status: "
-                    f"{trailing_status}"
-                ),
-                "trailing_stop": trailing_order,
-            }
-
-        expected_protection_side = (
-            "sell" if state["side"] == "LONG"
-            else "buy"
-        )
-
-        actual_protection_side = (
-            trailing_order.get("descr", {})
-            .get("type")
-        )
-
-        if actual_protection_side != expected_protection_side:
-            return {
-                "status": "RECOVERY_HALTED",
-                "reason": (
-                    "Trailing-stop side mismatch. "
-                    f"Expected {expected_protection_side}, "
-                    f"got {actual_protection_side}."
-                ),
-                "trailing_stop": trailing_order,
-            }
-
-        trailing_quantity = float(
-            trailing_order.get("vol", 0) or 0
-        )
-
-        if abs(trailing_quantity - float(state["amount"])) > 1e-8:
-            return {
-                "status": "RECOVERY_HALTED",
-                "reason": (
-                    "Trailing-stop quantity mismatch. "
-                    f"Expected {state['amount']}, "
-                    f"got {trailing_quantity}."
-                ),
-                "trailing_stop": trailing_order,
-            }
-
-        return {
-            "status": "RECOVERY_VERIFIED",
-            "entry": entry,
-            "trailing_stop": trailing_order,
-            "protection": {
-                "status": "VERIFIED",
-                "type": "TRAILING_STOP",
-                "order_id": state["stop_order_id"],
-            },
-            "state": state,
-        }
-
-    except Exception as exc:
-        return {
-            "status": "RECOVERY_HALTED",
-            "reason": str(exc)
-        }
-
-
-def detect_liquidity_sweeps(candle, previous):
-    """
-    Detect simple liquidity sweeps using the completed candle
-    and the immediately preceding completed candle.
-
-    Bullish sweep:
-        current low trades below previous low,
-        then current close recovers back above previous low.
-
-    Bearish sweep:
-        current high trades above previous high,
-        then current close falls back below previous high.
-    """
-    current_high = candle[2]
-    current_low = candle[3]
-    current_close = candle[4]
-
-    previous_high = previous[2]
-    previous_low = previous[3]
-
-    bullish_sweep = (
-        current_low < previous_low
-        and current_close > previous_low
-    )
-
-    bearish_sweep = (
-        current_high > previous_high
-        and current_close < previous_high
-    )
-
-    return {
-        "bullish": bullish_sweep,
-        "bearish": bearish_sweep,
-        "swept_low": previous_low,
-        "swept_high": previous_high
-    }
-
 def run_once():
     state = load_state()
 
@@ -2591,7 +2332,7 @@ def run_once():
 
         print("")
         print("LIVE PROTECTION: VERIFIED")
-        print("Native 0.25% trailing-stop protection is confirmed.")
+        print("Stop-loss and take-profit are confirmed.")
         print("PROTECTION-PENDING: CLEARED")
 
     # =========================
@@ -2616,7 +2357,7 @@ def run_once():
 
         print("")
         print("LIVE RECOVERY: VERIFIED")
-        print("Entry and native trailing-stop protection confirmed.")
+        print("Entry and protection orders confirmed.")
 
     # =========================
     # WAITING LIVE ENTRY GATE
@@ -2624,7 +2365,6 @@ def run_once():
     if (
         state.get("live_mode") is True
         and not state.get("active")
-        and state.get("entry_pending") is True
         and state.get("entry_order_id")
     ):
 
@@ -2700,7 +2440,7 @@ def run_once():
                 save_state(state)
 
                 print("LIVE PROTECTION: VERIFIED")
-                print("Native 0.25% trailing-stop protection is confirmed.")
+                print("Stop-loss and take-profit are confirmed.")
                 print("PROTECTION-PENDING: CLEARED")
                 print("NO NEW ORDERS WILL BE SUBMITTED")
                 return
@@ -3016,7 +2756,7 @@ def run_once():
         print(f"Target: {state.get('target')}")
         print("PAPER MANAGEMENT: BLOCKED")
         print("LIVE MANAGEMENT: PROTECTED")
-        print("Exchange-side native trailing-stop protection remains authoritative.")
+        print("Exchange-side stop-loss and take-profit remain authoritative.")
         print("NO ADDITIONAL LIVE ORDERS WILL BE SUBMITTED")
 
     # Existing PAPER position gets priority.

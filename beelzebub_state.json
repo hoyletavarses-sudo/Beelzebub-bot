@@ -1,0 +1,21 @@
+{
+  "active": false,
+  "entry_pending": false,
+  "side": "LONG",
+  "entry": 83920.0,
+  "stop": null,
+  "target": 84301.0,
+  "amount": 0.00010724499523355577,
+  "entry_time": "2026-09-30 12:15:00",
+  "pending_stop": 83729.5,
+  "entry_order_id": null,
+  "stop_order_id": null,
+  "target_order_id": null,
+  "protection_pending": false,
+  "live_mode": true,
+  "paper_pnl": 0.0,
+  "trades": 0,
+  "wins": 0,
+  "losses": 0,
+  "entry_type": "NORMAL_SHORT"
+}

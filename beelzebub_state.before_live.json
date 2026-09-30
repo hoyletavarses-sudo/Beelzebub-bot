@@ -1,0 +1,19 @@
+{
+  "active": false,
+  "side": null,
+  "entry": null,
+  "stop": null,
+  "target": null,
+  "amount": 0.0,
+  "entry_time": null,
+  "pending_stop": null,
+  "entry_order_id": null,
+  "stop_order_id": null,
+  "target_order_id": null,
+  "protection_pending": false,
+  "live_mode": false,
+  "paper_pnl": -0.1,
+  "trades": 1,
+  "wins": 0,
+  "losses": 1
+}

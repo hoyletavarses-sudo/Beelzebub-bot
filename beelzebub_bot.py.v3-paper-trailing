@@ -7,12 +7,11 @@ import websocket
 from datetime import datetime, timezone
 
 # =========================
-# BEELZEBUB V2 — LONG + SHORT SCALPING
+# BEELZEBUB V2 — LONG ONLY
 # =========================
 
 BOT_NAME = "BEELZEBUB V2"
 SYMBOL = "BTC/USD"
-MARGIN_SYMBOL = "BTC/USD:BTNL"
 TIMEFRAME = "15m"
 
 # SAFETY
@@ -21,7 +20,8 @@ LIVE_ORDERS_ENABLED = True
 
 # RISK
 MAX_RISK_USD = 2.00
-MAX_POSITION_USD = 9.00
+MAX_POSITION_USD = 25.00
+R_MULTIPLE = 2.0
 
 # STRATEGY
 SMA_FAST = 20
@@ -29,8 +29,7 @@ SMA_SLOW = 50
 RSI_PERIOD = 14
 RSI_THRESHOLD = 50
 VOLUME_PERIOD = 20
-VOLUME_MULTIPLIER = 0.85
-R_MULTIPLE = 2.0
+VOLUME_MULTIPLIER = 0.90
 
 STATE_FILE = "beelzebub_state.json"
 
@@ -40,12 +39,7 @@ exchange = ccxt.kraken({
     "enableRateLimit": True
 })
 def parse_spot_execution_snapshot(snapshot):
-    """Return normalized authenticated Kraken execution records.
-
-    Despite the historical function name, this parser intentionally
-    does not filter by SYMBOL. BTNL lifecycle management uses the
-    Kraken order ID as the authoritative identifier.
-    """
+    """Return complete normalized BTC/USD spot executions."""
     rows = snapshot.get("data", [])
     executions = []
 
@@ -61,6 +55,9 @@ def parse_spot_execution_snapshot(snapshot):
     )
 
     for row in rows:
+        if row.get("symbol") != SYMBOL:
+            continue
+
         if any(row.get(field) is None for field in required):
             continue
 
@@ -146,17 +143,10 @@ def execution_matches_order(execution, order_id):
     return execution.get("order_id") == order_id
 
 
-def confirm_entry_execution(
-    executions,
-    entry_order_id,
-    expected_side="buy"
-):
-    """Return the confirmed filled entry execution for the expected side."""
+def confirm_entry_execution(executions, entry_order_id):
+    """Return the confirmed filled LONG entry execution, or None."""
     if not entry_order_id:
         return None
-
-    if expected_side not in ("buy", "sell"):
-        raise ValueError("Expected entry side must be buy or sell.")
 
     for execution in executions:
         if not execution_matches_order(
@@ -168,7 +158,7 @@ def confirm_entry_execution(
         if execution.get("status") != "filled":
             continue
 
-        if execution.get("side") != expected_side:
+        if execution.get("side") != "buy":
             continue
 
         if execution.get("qty", 0) <= 0:
@@ -186,8 +176,7 @@ def set_waiting_for_fill(
     state,
     entry_order_id,
     requested_qty,
-    pending_stop,
-    side="LONG"
+    pending_stop
 ):
     """Set safe waiting state for a submitted live entry order."""
     if not entry_order_id:
@@ -199,12 +188,8 @@ def set_waiting_for_fill(
     if pending_stop <= 0:
         raise ValueError("Pending stop must be positive.")
 
-    if side not in ("LONG", "SHORT"):
-        raise ValueError("Entry side must be LONG or SHORT.")
-
     state["active"] = False
-    state["entry_pending"] = True
-    state["side"] = side
+    state["side"] = "LONG"
     state["entry"] = None
     state["stop"] = None
     state["target"] = None
@@ -221,17 +206,13 @@ def set_waiting_for_fill(
 
 
 def activate_confirmed_entry(state, fill_result, stop, target):
-    """Activate a LONG or SHORT position only after full entry fill confirmation."""
+    """Activate a LONG position only after full entry fill confirmation."""
     if not fill_result:
         raise ValueError("Confirmed fill result is required.")
 
     order_id = fill_result.get("order_id")
     qty = fill_result.get("qty", 0)
     average_price = fill_result.get("average_price", 0)
-    side = state.get("side")
-
-    if side not in ("LONG", "SHORT"):
-        raise ValueError("Confirmed entry requires LONG or SHORT state.")
 
     if not order_id:
         raise ValueError("Confirmed fill must contain an order ID.")
@@ -245,25 +226,14 @@ def activate_confirmed_entry(state, fill_result, stop, target):
     if stop <= 0:
         raise ValueError("Stop price must be positive.")
 
-    if target <= 0:
-        raise ValueError("Target price must be positive.")
+    if stop >= average_price:
+        raise ValueError("LONG stop must be below actual fill price.")
 
-    if side == "LONG":
-        if stop >= average_price:
-            raise ValueError("LONG stop must be below actual fill price.")
-
-        if target <= average_price:
-            raise ValueError("LONG target must be above actual fill price.")
-
-    else:
-        if stop <= average_price:
-            raise ValueError("SHORT stop must be above actual fill price.")
-
-        if target >= average_price:
-            raise ValueError("SHORT target must be below actual fill price.")
+    if target <= average_price:
+        raise ValueError("LONG target must be above actual fill price.")
 
     state["active"] = True
-    state["entry_pending"] = False
+    state["side"] = "LONG"
     state["entry"] = average_price
     state["stop"] = stop
     state["target"] = target
@@ -276,13 +246,10 @@ def activate_confirmed_entry(state, fill_result, stop, target):
     return state
 
 
-def set_protection_order_ids(state, stop_order_id, target_order_id=None):
-    """Record the single native trailing-stop protection order."""
-
+def set_protection_order_ids(state, stop_order_id, target_order_id):
+    """Record both protection order IDs after a confirmed active entry."""
     if not state.get("active"):
-        raise ValueError(
-            "Position must be active before protection is recorded."
-        )
+        raise ValueError("Position must be active before protection is recorded.")
 
     if not state.get("entry_order_id"):
         raise ValueError("Entry order ID is required.")
@@ -293,30 +260,39 @@ def set_protection_order_ids(state, stop_order_id, target_order_id=None):
         )
 
     if not stop_order_id:
-        raise ValueError(
-            "Trailing-stop order ID is required."
-        )
+        raise ValueError("Stop-loss order ID is required.")
+
+    if not target_order_id:
+        raise ValueError("Take-profit order ID is required.")
+
+    if stop_order_id == target_order_id:
+        raise ValueError("Stop-loss and take-profit IDs must be different.")
 
     state["stop_order_id"] = stop_order_id
-    state["target_order_id"] = None
+    state["target_order_id"] = target_order_id
     state["protection_pending"] = False
 
     return state
 
 
 def protection_orders_confirmed(state):
-    """Return True when an active position has its trailing-stop protection."""
-
+    """Return True only when an active LONG has both protection IDs."""
     if not state.get("active"):
         return False
 
-    if state.get("side") not in ("LONG", "SHORT"):
+    if state.get("side") != "LONG":
         return False
 
     if not state.get("entry_order_id"):
         return False
 
-    if not state.get("stop_order_id"):
+    stop_order_id = state.get("stop_order_id")
+    target_order_id = state.get("target_order_id")
+
+    if not stop_order_id or not target_order_id:
+        return False
+
+    if stop_order_id == target_order_id:
         return False
 
     return True
@@ -506,7 +482,7 @@ def protection_submission_allowed(
     if state.get("live_mode") is not True:
         return False
 
-    if state.get("side") not in ("LONG", "SHORT"):
+    if state.get("side") != "LONG":
         return False
 
     if quantity <= 0:
@@ -521,253 +497,46 @@ def protection_submission_allowed(
     return True
 
 
-def get_authenticated_open_orders_v1():
-    """Read current Kraken v1 authenticated open orders. Read-only."""
-
-    response = exchange.privatePostGetWebSocketsToken()
-    token = response.get("result", {}).get("token")
-
-    if not token:
-        raise RuntimeError(
-            "Kraken WebSocket authentication token was not received."
-        )
-
-    ws = websocket.create_connection(
-        "wss://ws-auth.kraken.com",
-        timeout=10
-    )
-
-    try:
-        ws.send(json.dumps({
-            "event": "subscribe",
-            "subscription": {
-                "name": "openOrders",
-                "token": token
-            }
-        }))
-
-        for _ in range(10):
-            message = json.loads(ws.recv())
-
-            # Kraken can send the openOrders snapshot before
-            # the subscriptionStatus event.
-            if isinstance(message, list):
-                if len(message) >= 1:
-                    orders = message[0]
-
-                    if isinstance(orders, list):
-                        normalized = {}
-
-                        for order in orders:
-                            if not isinstance(order, dict):
-                                continue
-
-                            order_id = (
-                                order.get("orderid")
-                                or order.get("order_id")
-                            )
-
-                            if order_id:
-                                normalized[order_id] = order
-
-                        return normalized
-
-                continue
-
-            if not isinstance(message, dict):
-                continue
-
-            if message.get("event") == "subscriptionStatus":
-                if message.get("status") != "subscribed":
-                    raise RuntimeError(
-                        "Kraken openOrders subscription failed: "
-                        + str(message)
-                    )
-
-                continue
-
-        raise RuntimeError(
-            "Kraken openOrders snapshot was not received."
-        )
-
-    finally:
-        ws.close()
-
-
-def get_authenticated_order_history_v1(order_id):
-    """Read one Kraken order from authenticated QueryOrders. Read-only."""
-
-    if not order_id:
-        raise ValueError("Order ID is required.")
-
-    response = exchange.privatePostQueryOrders({
-        "txid": order_id,
-        "trades": True
-    })
-
-    result = response.get("result", {})
-
-    if not isinstance(result, dict):
-        raise RuntimeError(
-            "Kraken QueryOrders returned an invalid result."
-        )
-
-    order = result.get(order_id)
-
-    if order is None:
-        raise RuntimeError(
-            f"Kraken QueryOrders did not return order {order_id}."
-        )
-
-    return order
-
-
-def normalize_open_order_v1(order_id, order_data):
-    """Normalize one Kraken v1 openOrders record."""
-
-    if not isinstance(order_data, dict):
-        raise ValueError(
-            "Kraken open order data must be a dictionary."
-        )
-
-    descr = order_data.get("descr", {})
-
-    order_type = descr.get("ordertype")
-    side = descr.get("type")
-
-    quantity = float(
-        order_data.get("vol", 0) or 0
-    )
-
-    executed_quantity = float(
-        order_data.get("vol_exec", 0) or 0
-    )
-
-    stop_price = float(
-        order_data.get("stopprice", 0) or 0
-    )
-
-    limit_price = float(
-        order_data.get("limitprice", 0) or 0
-    )
-
-    return {
-        "order_id": order_id,
-        "symbol": MARGIN_SYMBOL,
-        "side": side,
-        "type": order_type,
-        "status": order_data.get("status"),
-        "amount": quantity,
-        "executed_amount": executed_quantity,
-        "price": limit_price,
-        "trigger_price": stop_price if stop_price > 0 else None,
-        "stop_loss_price": (
-            stop_price
-            if order_type in (
-                "stop-loss",
-                "stop-loss-limit"
-            ) and stop_price > 0
-            else None
-        ),
-        "take_profit_price": (
-            stop_price
-            if order_type in (
-                "take-profit",
-                "take-profit-limit"
-            ) and stop_price > 0
-            else None
-        ),
-        "client_order_id": order_data.get("cl_ord_id"),
-        "raw": order_data
-    }
-
-
 def verify_live_order(order_id):
-    """Verify one Kraken order using openOrders and executions."""
-
+    """Read and normalize one existing Kraken order."""
     if not order_id:
         raise ValueError("Order ID is required.")
 
-    # First check currently open orders.
-    try:
-        open_orders = get_authenticated_open_orders_v1()
+    order = exchange.fetch_order(
+        order_id,
+        SYMBOL
+    )
 
-        for item in open_orders:
-            if not isinstance(item, dict):
-                continue
-
-            for candidate_id, candidate_data in item.items():
-                if candidate_id != order_id:
-                    continue
-
-                return normalize_open_order_v1(
-                    candidate_id,
-                    candidate_data
-                )
-
-    except Exception as exc:
-        open_error = str(exc)
-    else:
-        open_error = None
-
-    # If it is not open, inspect authenticated executions.
-    executions = get_authenticated_execution_snapshot()
-
-    matches = [
-        execution
-        for execution in executions
-        if execution_matches_order(execution, order_id)
-    ]
-
-    if not matches:
-        if open_error:
-            raise RuntimeError(
-                f"Kraken order {order_id} was not found. "
-                f"Open-order lookup error: {open_error}"
-            )
-
+    if not order:
         raise RuntimeError(
-            f"Kraken order {order_id} was not present in "
-            "the open-order or execution snapshot."
+            "Kraken returned no order data."
         )
 
-    total_qty = sum(
-        float(execution.get("qty", 0))
-        for execution in matches
-        if execution.get("status") == "filled"
-    )
+    if order.get("id") != order_id:
+        raise RuntimeError(
+            "Kraken returned a different order ID."
+        )
 
-    weighted_value = sum(
-        float(execution.get("qty", 0))
-        * float(execution.get("price", 0))
-        for execution in matches
-        if execution.get("status") == "filled"
-    )
-
-    average_price = (
-        weighted_value / total_qty
-        if total_qty > 0
-        else float(matches[0].get("price", 0))
-    )
-
-    latest = matches[0]
+    if order.get("symbol") != SYMBOL:
+        raise RuntimeError(
+            "Kraken returned an unexpected symbol."
+        )
 
     return {
-        "order_id": order_id,
-        "symbol": MARGIN_SYMBOL,
-        "side": latest.get("side"),
-        "type": latest.get("order_type"),
-        "status": latest.get("status"),
-        "amount": total_qty,
-        "price": average_price,
-        "trigger_price": None,
-        "stop_loss_price": None,
-        "take_profit_price": None,
-        "client_order_id": None,
-        "execution_count": len(matches),
-        "raw": matches
+        "order_id": order.get("id"),
+        "client_order_id": order.get("clientOrderId"),
+        "symbol": order.get("symbol"),
+        "type": order.get("type"),
+        "side": order.get("side"),
+        "status": order.get("status"),
+        "amount": order.get("amount"),
+        "filled": order.get("filled"),
+        "average": order.get("average"),
+        "price": order.get("price"),
+        "trigger_price": order.get("triggerPrice"),
+        "stop_loss_price": order.get("stopLossPrice"),
+        "take_profit_price": order.get("takeProfitPrice")
     }
-
 
 def validate_kraken_v2_protection_request(request):
     """Validate one Kraken WebSocket v2 protection request without submitting it."""
@@ -784,19 +553,18 @@ def validate_kraken_v2_protection_request(request):
 
     if params.get("order_type") not in (
         "stop-loss",
-        "take-profit",
-        "trailing-stop"
+        "take-profit"
     ):
         raise ValueError(
-            "Unsupported protection order type."
+            "Only stop-loss and take-profit validation is allowed."
         )
 
-    if params.get("side") not in ("buy", "sell"):
+    if params.get("side") != "sell":
         raise ValueError(
-            "Protection validation side must be buy or sell."
+            "Protection validation must use sell side."
         )
 
-    if params.get("symbol") != "XBT/USD:BTNL":
+    if params.get("symbol") != SYMBOL:
         raise ValueError(
             "Protection validation symbol is incorrect."
         )
@@ -977,8 +745,7 @@ def submit_kraken_v2_protection_request(request):
             if message.get("method") == "add_order":
                 if message.get("success") is not True:
                     raise RuntimeError(
-                        "Kraken rejected the protection order: "
-                        + str(message)
+                        "Kraken rejected the protection order."
                     )
 
                 result = message.get("result", {})
@@ -999,97 +766,6 @@ def submit_kraken_v2_protection_request(request):
 
         raise RuntimeError(
             "Kraken protection-order response was not received."
-        )
-
-    finally:
-        ws.close()
-
-
-def cancel_live_order(order_id):
-    """Cancel exactly one Kraken order through WebSocket v2."""
-
-    if LIVE_ORDERS_ENABLED is not True:
-        print("")
-        print("LIVE EXECUTION: DISABLED")
-        print("No live cancellation submitted.")
-        return None
-
-    if not order_id:
-        raise ValueError("Live cancellation requires an order ID.")
-
-    response = exchange.privatePostGetWebSocketsToken()
-    token = response.get("result", {}).get("token")
-
-    if not token:
-        raise RuntimeError(
-            "Kraken WebSocket authentication token was not received."
-        )
-
-    ws = websocket.create_connection(
-        "wss://ws-auth.kraken.com/v2",
-        timeout=10
-    )
-
-    try:
-        ws.send(json.dumps({
-            "method": "subscribe",
-            "params": {
-                "channel": "executions",
-                "snap_orders": False,
-                "snap_trades": False,
-                "token": token
-            }
-        }))
-
-        subscription_confirmed = False
-
-        for _ in range(5):
-            message = json.loads(ws.recv())
-
-            if message.get("method") == "subscribe":
-                if message.get("success") is not True:
-                    raise RuntimeError(
-                        "Kraken authenticated WebSocket subscription failed."
-                    )
-
-                subscription_confirmed = True
-                break
-
-        if not subscription_confirmed:
-            raise RuntimeError(
-                "Kraken authenticated WebSocket subscription "
-                "was not confirmed."
-            )
-
-        ws.send(json.dumps({
-            "method": "cancel_order",
-            "params": {
-                "order_id": [order_id],
-                "token": token
-            }
-        }))
-
-        for _ in range(5):
-            message = json.loads(ws.recv())
-
-            if message.get("method") == "cancel_order":
-                if message.get("success") is not True:
-                    raise RuntimeError(
-                        "Kraken rejected the cancellation: "
-                        + str(message)
-                    )
-
-                result = message.get("result", {})
-
-                return {
-                    "order_id": order_id,
-                    "success": True,
-                    "raw": message,
-                    "result": result
-                }
-
-        raise RuntimeError(
-            "Kraken cancellation response was not received."
         )
 
     finally:
@@ -1140,60 +816,18 @@ def submit_kraken_v2_protection_pair(
             target_request
         )
     except Exception as exc:
-        cancel_result = None
-        cancel_error = None
-
-        try:
-            cancel_result = cancel_live_order(
-                stop_result["order_id"]
-            )
-        except Exception as cancel_exc:
-            cancel_error = str(cancel_exc)
-
-        if cancel_error:
-            return {
-                "status": "TARGET_FAILED_STOP_ACTIVE",
-                "stop": stop_result,
-                "target": None,
-                "cancel": cancel_result,
-                "error": str(exc),
-                "cancel_error": cancel_error
-            }
-
         return {
-            "status": "TARGET_FAILED_STOP_CLEANED",
+            "status": "TARGET_FAILED_STOP_ACTIVE",
             "stop": stop_result,
             "target": None,
-            "cancel": cancel_result,
             "error": str(exc)
         }
 
     if not target_result or not target_result.get("order_id"):
-        cancel_result = None
-        cancel_error = None
-
-        try:
-            cancel_result = cancel_live_order(
-                stop_result["order_id"]
-            )
-        except Exception as cancel_exc:
-            cancel_error = str(cancel_exc)
-
-        if cancel_error:
-            return {
-                "status": "TARGET_FAILED_STOP_ACTIVE",
-                "stop": stop_result,
-                "target": target_result,
-                "cancel": cancel_result,
-                "error": "Take-profit submission returned no order ID.",
-                "cancel_error": cancel_error
-            }
-
         return {
-            "status": "TARGET_FAILED_STOP_CLEANED",
+            "status": "TARGET_FAILED_STOP_ACTIVE",
             "stop": stop_result,
             "target": target_result,
-            "cancel": cancel_result,
             "error": "Take-profit submission returned no order ID."
         }
 
@@ -1201,31 +835,15 @@ def submit_kraken_v2_protection_pair(
         stop_result["order_id"]
         == target_result["order_id"]
     ):
-        cancel_result = None
-        cancel_error = None
-
-        try:
-            cancel_result = cancel_live_order(
-                stop_result["order_id"]
-            )
-        except Exception as cancel_exc:
-            cancel_error = str(cancel_exc)
-
-        result = {
+        return {
             "status": "INVALID_DUPLICATE_ORDER_ID",
             "stop": stop_result,
             "target": target_result,
-            "cancel": cancel_result,
             "error": (
                 "Stop-loss and take-profit returned "
                 "the same order ID."
             )
         }
-
-        if cancel_error:
-            result["cancel_error"] = cancel_error
-
-        return result
 
     return {
         "status": "BOTH_SUBMITTED",
@@ -1236,8 +854,7 @@ def submit_kraken_v2_protection_pair(
 
 
 def establish_live_protection(state):
-    """Submit and verify one native 0.25% trailing-stop protection order."""
-
+    """Submit and verify live protection for an active LONG position."""
     if not state.get("active"):
         return {
             "status": "NO_ACTIVE_POSITION",
@@ -1247,6 +864,13 @@ def establish_live_protection(state):
     if state.get("live_mode") is not True:
         return {
             "status": "NOT_LIVE_POSITION",
+            "state": state
+        }
+
+    if state.get("side") != "LONG":
+        return {
+            "status": "PROTECTION_HALTED",
+            "reason": "Only LONG protection is currently supported.",
             "state": state
         }
 
@@ -1273,114 +897,59 @@ def establish_live_protection(state):
     try:
         requests = build_kraken_v2_protection_requests(
             state,
-            state.get("stop", 0),
-            state.get("target", 0),
+            state["stop"],
+            state["target"],
             entry_order_id
         )
 
-        trailing_request = requests["trailing_stop"]
-
-        submission = submit_kraken_v2_protection_request(
-            trailing_request
+        submission = submit_kraken_v2_protection_pair(
+            requests["stop_loss"],
+            requests["take_profit"]
         )
 
         if not submission:
             return {
                 "status": "PROTECTION_HALTED",
-                "reason": "Trailing-stop submission returned no result.",
+                "reason": "Protection submission returned no result.",
                 "state": state
             }
 
-        if submission.get("success") is not True:
+        if submission.get("status") != "BOTH_SUBMITTED":
             return {
                 "status": "PROTECTION_HALTED",
                 "reason": submission.get(
                     "error",
-                    "Trailing-stop submission failed."
+                    "Protection pair was not fully submitted."
                 ),
-                "submission": submission,
+                "submission_status": submission.get("status"),
+                "stop": submission.get("stop"),
+                "target": submission.get("target"),
                 "state": state
             }
 
-        trailing_order_id = submission.get("order_id")
+        stop_order_id = submission["stop"]["order_id"]
+        target_order_id = submission["target"]["order_id"]
 
-        if not trailing_order_id:
-            return {
-                "status": "PROTECTION_HALTED",
-                "reason": "Kraken did not return a trailing-stop order ID.",
-                "submission": submission,
-                "state": state
-            }
-
-        verified_order = get_authenticated_order_history_v1(
-            trailing_order_id
+        verification = verify_protection_pair(
+            stop_order_id,
+            target_order_id,
+            state["amount"],
+            state["stop"],
+            state["target"],
+            state["entry_order_id"]
         )
 
-        if not verified_order:
+        if verification.get("status") != "VERIFIED":
             return {
                 "status": "PROTECTION_HALTED",
-                "reason": "Trailing-stop order could not be verified.",
-                "order_id": trailing_order_id,
-                "state": state
-            }
-
-        order_status = verified_order.get("status")
-
-        if order_status not in ("open", "pending"):
-            return {
-                "status": "PROTECTION_HALTED",
-                "reason": (
-                    "Trailing-stop order was returned with an unexpected "
-                    f"status: {order_status}"
-                ),
-                "order_id": trailing_order_id,
-                "order": verified_order,
-                "state": state
-            }
-
-        expected_side = (
-            "sell"
-            if state.get("side") == "LONG"
-            else "buy"
-        )
-
-        actual_side = (
-            verified_order.get("descr", {})
-            .get("type")
-        )
-
-        if actual_side != expected_side:
-            return {
-                "status": "PROTECTION_HALTED",
-                "reason": (
-                    f"Trailing-stop side mismatch. "
-                    f"Expected {expected_side}, got {actual_side}."
-                ),
-                "order_id": trailing_order_id,
-                "order": verified_order,
-                "state": state
-            }
-
-        actual_quantity = float(
-            verified_order.get("vol", 0) or 0
-        )
-
-        if abs(actual_quantity - float(state["amount"])) > 1e-8:
-            return {
-                "status": "PROTECTION_HALTED",
-                "reason": (
-                    "Trailing-stop quantity mismatch. "
-                    f"Expected {state['amount']}, "
-                    f"got {actual_quantity}."
-                ),
-                "order_id": trailing_order_id,
-                "order": verified_order,
+                "reason": "Protection verification did not return VERIFIED.",
                 "state": state
             }
 
         state = set_protection_order_ids(
             state,
-            trailing_order_id
+            stop_order_id,
+            target_order_id
         )
 
         save_state(state)
@@ -1388,18 +957,14 @@ def establish_live_protection(state):
         if not protection_orders_confirmed(state):
             return {
                 "status": "PROTECTION_HALTED",
-                "reason": (
-                    "Trailing-stop state failed final confirmation."
-                ),
+                "reason": "Protection state failed final confirmation.",
                 "state": state
             }
 
         return {
             "status": "PROTECTION_ESTABLISHED",
-            "protection_type": "TRAILING_STOP",
-            "trailing_stop_order_id": trailing_order_id,
             "state": state,
-            "verification": verified_order
+            "verification": verification
         }
 
     except Exception as exc:
@@ -1411,15 +976,18 @@ def establish_live_protection(state):
 
 
 def protection_client_id(prefix, entry_order_id):
-    """Build a unique Kraken-compatible protection client ID."""
+    """Build a deterministic Kraken-compatible protection client ID."""
     if prefix not in ("S", "T"):
         raise ValueError("Protection client ID prefix must be S or T.")
 
-    # Kraken requires cl_ord_id to be unique among open orders.
-    # Use a fresh 12-hex-character suffix for every protection submission.
-    unique_id = os.urandom(6).hex()
+    if not entry_order_id:
+        raise ValueError("Entry order ID is required.")
 
-    return f"{prefix}-{unique_id}"
+    digest = hashlib.sha256(
+        str(entry_order_id).encode("utf-8")
+    ).hexdigest()[:12]
+
+    return f"{prefix}-{digest}"
 
 
 def verify_protection_pair(
@@ -1428,16 +996,9 @@ def verify_protection_pair(
     expected_quantity,
     expected_stop,
     expected_target,
-    entry_order_id,
-    position_side="LONG"
+    entry_order_id
 ):
-    """Verify both protection orders using Kraken lifecycle data."""
-
-    if position_side not in ("LONG", "SHORT"):
-        raise ValueError(
-            "Position side must be LONG or SHORT."
-        )
-
+    """Verify both live protection orders using read-only exchange data."""
     if not entry_order_id:
         raise ValueError(
             "Entry order ID is required for protection verification."
@@ -1466,46 +1027,58 @@ def verify_protection_pair(
     stop = verify_live_order(stop_order_id)
     target = verify_live_order(target_order_id)
 
-    expected_protection_side = (
-        "buy"
-        if position_side == "SHORT"
-        else "sell"
-    )
-
-    if stop.get("side") != expected_protection_side:
+    if stop.get("symbol") != SYMBOL:
         raise RuntimeError(
-            "Verified stop-loss has the wrong side."
+            "Verified stop-loss has unexpected symbol."
         )
 
-    if target.get("side") != expected_protection_side:
+    if target.get("symbol") != SYMBOL:
         raise RuntimeError(
-            "Verified take-profit has the wrong side."
+            "Verified take-profit has unexpected symbol."
         )
 
-    if stop.get("status") != "open":
+    if stop.get("side") != "sell":
         raise RuntimeError(
-            "Verified stop-loss is not currently open."
+            "Verified stop-loss is not a sell order."
         )
 
-    if target.get("status") != "open":
+    if target.get("side") != "sell":
         raise RuntimeError(
-            "Verified take-profit is not currently open."
+            "Verified take-profit is not a sell order."
         )
 
-    if stop.get("type") not in (
-        "stop-loss",
-        "stop-loss-limit"
-    ):
+    if stop.get("type") != "stop-loss":
         raise RuntimeError(
             "Verified stop-loss has unexpected order type."
         )
 
-    if target.get("type") not in (
-        "take-profit",
-        "take-profit-limit"
-    ):
+    if target.get("type") != "take-profit":
         raise RuntimeError(
             "Verified take-profit has unexpected order type."
+        )
+
+    if stop.get("status") != "open":
+        raise RuntimeError(
+            "Verified stop-loss is not open."
+        )
+
+    if target.get("status") != "open":
+        raise RuntimeError(
+            "Verified take-profit is not open."
+        )
+
+    expected_stop_client_id = protection_client_id("S", entry_order_id)
+
+    if stop.get("client_order_id") != expected_stop_client_id:
+        raise RuntimeError(
+            "Verified stop-loss client order ID does not match expected entry."
+        )
+
+    expected_target_client_id = protection_client_id("T", entry_order_id)
+
+    if target.get("client_order_id") != expected_target_client_id:
+        raise RuntimeError(
+            "Verified take-profit client order ID does not match expected entry."
         )
 
     stop_amount = stop.get("amount")
@@ -1528,8 +1101,17 @@ def verify_protection_pair(
             "Verified take-profit quantity does not match expected quantity."
         )
 
-    stop_trigger = stop.get("stop_loss_price")
-    target_trigger = target.get("take_profit_price")
+    stop_trigger = (
+        stop.get("stop_loss_price")
+        if stop.get("stop_loss_price") is not None
+        else stop.get("trigger_price")
+    )
+
+    target_trigger = (
+        target.get("take_profit_price")
+        if target.get("take_profit_price") is not None
+        else target.get("trigger_price")
+    )
 
     if stop_trigger is None:
         raise RuntimeError(
@@ -1541,25 +1123,14 @@ def verify_protection_pair(
             "Verified take-profit is missing trigger price."
         )
 
-    if position_side == "LONG":
-        if stop_trigger >= target_trigger:
-            raise RuntimeError(
-                "LONG protection prices are invalid."
-            )
-    else:
-        if stop_trigger <= target_trigger:
-            raise RuntimeError(
-                "SHORT protection prices are invalid."
-            )
-
     if abs(stop_trigger - expected_stop) > 0.11:
         raise RuntimeError(
-            "Verified stop-loss trigger does not match expected price."
+            "Verified stop-loss trigger price does not match expected price."
         )
 
     if abs(target_trigger - expected_target) > 0.11:
         raise RuntimeError(
-            "Verified take-profit trigger does not match expected price."
+            "Verified take-profit trigger price does not match expected price."
         )
 
     return {
@@ -1568,96 +1139,20 @@ def verify_protection_pair(
         "target": target
     }
 
-
 def build_kraken_v2_protection_requests(
     position,
     stop,
     target,
     entry_order_id
 ):
-    """Build one native 0.25% Kraken trailing-stop protection order."""
-
+    """Build Kraken WebSocket v2 protection requests without submitting them."""
     if not entry_order_id:
         raise ValueError(
-            "Entry order ID is required for protection."
+            "Entry order ID is required for protection IDs."
         )
 
     if not position:
         raise ValueError("Position data is required.")
-
-    position_side = position.get("side")
-
-    if position_side not in ("LONG", "SHORT"):
-        raise ValueError(
-            "Position side must be LONG or SHORT."
-        )
-
-    quantity = float(position.get("amount", 0))
-    entry = float(position.get("entry", 0))
-
-    if quantity <= 0:
-        raise ValueError(
-            "Protection quantity must be positive."
-        )
-
-    if entry <= 0:
-        raise ValueError(
-            "Actual entry price must be positive."
-        )
-
-    protection_side = (
-        "sell"
-        if position_side == "LONG"
-        else "buy"
-    )
-
-    order_quantity = float(f"{quantity:.8f}")
-
-    if order_quantity <= 0:
-        raise ValueError(
-            "Formatted protection quantity is invalid."
-        )
-
-    return {
-        "trailing_stop": {
-            "method": "add_order",
-            "params": {
-                "order_type": "trailing-stop",
-                "side": protection_side,
-                "order_qty": order_quantity,
-                "symbol": "XBT/USD:BTNL",
-                "triggers": {
-                    "reference": "index",
-                    "price": 0.25,
-                    "price_type": "pct"
-                },
-                "cl_ord_id": protection_client_id(
-                    "S",
-                    entry_order_id
-                ),
-                "margin": True,
-                "reduce_only": True,
-                "validate": True
-            }
-        }
-    }
-
-
-def build_live_protection_orders(
-    position,
-    stop,
-    target
-):
-    """Build validated LONG or SHORT protection orders without submitting them."""
-    if not position:
-        raise ValueError("Position data is required.")
-
-    position_side = position.get("side", "LONG")
-
-    if position_side not in ("LONG", "SHORT"):
-        raise ValueError(
-            "Protection position side must be LONG or SHORT."
-        )
 
     quantity = position.get("amount", 0)
     entry = position.get("entry", 0)
@@ -1673,33 +1168,117 @@ def build_live_protection_orders(
             "Protection prices must be positive."
         )
 
-    if position_side == "LONG":
+    if stop >= entry:
+        raise ValueError(
+            "LONG stop must be below actual entry."
+        )
 
-        if stop >= entry:
-            raise ValueError(
-                "LONG stop must be below actual entry."
-            )
+    if target <= entry:
+        raise ValueError(
+            "LONG target must be above actual entry."
+        )
 
-        if target <= entry:
-            raise ValueError(
-                "LONG target must be above actual entry."
-            )
+    exchange.load_markets()
 
-        protection_side = "sell"
+    order_quantity = float(
+        exchange.amount_to_precision(
+            SYMBOL,
+            quantity
+        )
+    )
 
-    else:
+    stop_price = float(
+        exchange.price_to_precision(
+            SYMBOL,
+            stop
+        )
+    )
 
-        if stop <= entry:
-            raise ValueError(
-                "SHORT stop must be above actual entry."
-            )
+    target_price = float(
+        exchange.price_to_precision(
+            SYMBOL,
+            target
+        )
+    )
 
-        if target >= entry:
-            raise ValueError(
-                "SHORT target must be below actual entry."
-            )
+    if order_quantity <= 0:
+        raise ValueError(
+            "Formatted protection quantity is invalid."
+        )
 
-        protection_side = "buy"
+    if stop_price <= 0 or target_price <= 0:
+        raise ValueError(
+            "Formatted protection price is invalid."
+        )
+
+    return {
+        "stop_loss": {
+            "method": "add_order",
+            "params": {
+                "order_type": "stop-loss",
+                "side": "sell",
+                "order_qty": order_quantity,
+                "symbol": SYMBOL,
+                "triggers": {
+                    "reference": "last",
+                    "price": stop_price,
+                    "price_type": "static"
+                },
+                "cl_ord_id": protection_client_id("S", entry_order_id),
+                "validate": True
+            }
+        },
+        "take_profit": {
+            "method": "add_order",
+            "params": {
+                "order_type": "take-profit",
+                "side": "sell",
+                "order_qty": order_quantity,
+                "symbol": SYMBOL,
+                "triggers": {
+                    "reference": "last",
+                    "price": target_price,
+                    "price_type": "static"
+                },
+                "cl_ord_id": protection_client_id("T", entry_order_id),
+                "validate": True
+            }
+        }
+    }
+
+
+def build_live_protection_orders(
+    position,
+    stop,
+    target
+):
+    """Build validated LONG protection orders without submitting them."""
+    if not position:
+        raise ValueError("Position data is required.")
+
+    quantity = position.get("amount", 0)
+    entry = position.get("entry", 0)
+
+    if quantity <= 0:
+        raise ValueError("Protection quantity must be positive.")
+
+    if entry <= 0:
+        raise ValueError("Actual entry price must be positive.")
+
+    if stop <= 0 or target <= 0:
+        raise ValueError(
+            "Protection prices must be positive."
+        )
+
+    if stop >= entry:
+        raise ValueError(
+            "LONG stop must be below actual entry."
+        )
+
+    if target <= entry:
+        raise ValueError(
+            "LONG target must be above actual entry."
+        )
 
     exchange.load_markets()
 
@@ -1743,24 +1322,22 @@ def build_live_protection_orders(
 
     return {
         "symbol": SYMBOL,
-        "side": position_side,
         "quantity": quantity,
         "stop": {
-            "side": protection_side,
+            "side": "sell",
             "quantity": stop_quantity,
             "price": stop_price
         },
         "target": {
-            "side": protection_side,
+            "side": "sell",
             "quantity": target_quantity,
             "price": target_price
         }
     }
 
 
-
 def process_waiting_entry(state, executions):
-    """Process a waiting LONG or SHORT entry without submitting orders."""
+    """Process a waiting LONG entry without submitting any orders."""
     if state.get("live_mode") is not True:
         return {
             "status": "NOT_LIVE",
@@ -1776,12 +1353,6 @@ def process_waiting_entry(state, executions):
     entry_order_id = state.get("entry_order_id")
     requested_qty = state.get("amount", 0)
     pending_stop = state.get("pending_stop")
-    side = state.get("side")
-
-    if side not in ("LONG", "SHORT"):
-        raise ValueError(
-            "Waiting entry requires LONG or SHORT side."
-        )
 
     if not entry_order_id:
         return {
@@ -1790,9 +1361,7 @@ def process_waiting_entry(state, executions):
         }
 
     if requested_qty <= 0:
-        raise ValueError(
-            "Waiting entry quantity must be positive."
-        )
+        raise ValueError("Waiting entry quantity must be positive.")
 
     if pending_stop is None:
         raise ValueError(
@@ -1804,17 +1373,10 @@ def process_waiting_entry(state, executions):
             "Pending stop must be positive."
         )
 
-    expected_entry_side = (
-        "sell"
-        if side == "SHORT"
-        else "buy"
-    )
-
     fill_result = confirm_entry_quantity(
         executions,
         entry_order_id,
-        requested_qty,
-        expected_entry_side
+        requested_qty
     )
 
     if not fill_result:
@@ -1825,38 +1387,17 @@ def process_waiting_entry(state, executions):
 
     average_price = fill_result["average_price"]
 
-    if side == "LONG":
-
-        if pending_stop >= average_price:
-            raise ValueError(
-                "LONG pending stop must be below actual fill price."
-            )
-
-        risk_distance = (
-            average_price - pending_stop
+    if pending_stop >= average_price:
+        raise ValueError(
+            "LONG pending stop must be below actual fill price."
         )
 
-        target = average_price + (
-            risk_distance * R_MULTIPLE
-        )
+    risk_distance = average_price - pending_stop
 
-    else:
+    target = average_price + (
+        risk_distance * R_MULTIPLE
+    )
 
-        if pending_stop <= average_price:
-            raise ValueError(
-                "SHORT pending stop must be above actual fill price."
-            )
-
-        risk_distance = (
-            pending_stop - average_price
-        )
-
-        target = average_price - (
-            risk_distance * R_MULTIPLE
-        )
-
-    # Use the actual confirmed filled quantity and weighted-average
-    # fill price for the live position.
     state = activate_confirmed_entry(
         state,
         fill_result,
@@ -1871,24 +1412,13 @@ def process_waiting_entry(state, executions):
     }
 
 
-
-def confirm_entry_quantity(
-    executions,
-    entry_order_id,
-    requested_qty,
-    expected_side="buy"
-):
+def confirm_entry_quantity(executions, entry_order_id, requested_qty):
     """Return aggregated filled entry data when the full quantity is confirmed."""
     if not entry_order_id:
         return None
 
     if requested_qty <= 0:
         return None
-
-    if expected_side not in ("buy", "sell"):
-        raise ValueError(
-            "Expected entry side must be buy or sell."
-        )
 
     matched = []
     seen_exec_ids = set()
@@ -1903,7 +1433,7 @@ def confirm_entry_quantity(
         if execution.get("status") != "filled":
             continue
 
-        if execution.get("side") != expected_side:
+        if execution.get("side") != "buy":
             continue
 
         exec_id = execution.get("exec_id")
@@ -1955,7 +1485,6 @@ def confirm_entry_quantity(
 def load_state():
     default = {
         "active": False,
-        "entry_pending": False,
         "side": None,
         "entry": None,
         "stop": None,
@@ -2053,299 +1582,283 @@ def get_completed_candles():
     return candles[:-1]
 
 
-
-
 def position_size(entry, stop):
-    """Calculate BTC position size using risk and maximum position value caps."""
-
-    entry = float(entry)
-    stop = float(stop)
-
-    if entry <= 0:
-        return 0.0
-
     risk_distance = abs(entry - stop)
 
     if risk_distance <= 0:
         return 0.0
 
-    risk_based_amount = MAX_RISK_USD / risk_distance
-    position_cap_amount = MAX_POSITION_USD / entry
-
-    amount = min(
-        risk_based_amount,
-        position_cap_amount
+    amount_by_risk = (
+        MAX_RISK_USD / risk_distance
     )
 
-    return max(amount, 0.0)
+    amount_by_value = (
+        MAX_POSITION_USD / entry
+    )
+
+    return min(
+        amount_by_risk,
+        amount_by_value
+    )
 
 
-def build_kraken_v2_margin_entry_request(side, entry, amount):
-    """Build a validation-only Kraken BTNL margin entry request."""
+def clear_position(state):
+    state["active"] = False
+    state["side"] = None
+    state["entry"] = None
+    state["stop"] = None
+    state["target"] = None
+    state["amount"] = 0.0
+    state["entry_time"] = None
+    state["pending_stop"] = None
+    state["entry_order_id"] = None
+    state["stop_order_id"] = None
+    state["target_order_id"] = None
+    state["protection_pending"] = False
+    state["live_mode"] = False
 
-    if side not in ("buy", "sell"):
-        raise ValueError(
-            "BTNL entry side must be buy or sell."
+
+def show_paper_position(state, current_price):
+    entry = state["entry"]
+    stop = state["stop"]
+    amount = state["amount"]
+    side = state.get("side")
+
+    if side == "SHORT":
+        unrealized = (entry - current_price) * amount
+    else:
+        unrealized = (current_price - entry) * amount
+
+    print("")
+    print(f"PAPER {side} ACTIVE")
+    print(f"Entry: {entry:.2f}")
+    print(f"Trailing Stop: {stop:.2f}")
+    print(f"Position Size: {amount:.8f} BTC")
+    print(f"Position Value: ${amount * entry:.2f}")
+    print(f"Current: {current_price:.2f}")
+    print(f"Unrealized P/L: ${unrealized:.4f}")
+
+
+def manage_paper_position(state, candle):
+    if state.get("live_mode") is True:
+        raise RuntimeError(
+            "SAFETY BLOCK: live position cannot enter paper management."
         )
+
+    if not state["active"]:
+        return False
+
+    low = candle[3]
+    high = candle[2]
+    close = candle[4]
+
+    entry = state["entry"]
+    stop = state["stop"]
+    amount = state["amount"]
+    side = state.get("side")
+
+    # LONG trailing stop:
+    # move the stop upward using the completed candle low.
+    if side == "LONG":
+
+        if low <= stop:
+            pnl = (stop - entry) * amount
+
+            state["paper_pnl"] += pnl
+            state["trades"] += 1
+
+            if pnl >= 0:
+                state["wins"] += 1
+            else:
+                state["losses"] += 1
+
+            print("")
+            print("PAPER LONG TRAILING STOP HIT")
+            print(f"Exit: {stop:.2f}")
+            print(f"P/L: ${pnl:.4f}")
+
+            clear_position(state)
+            save_state(state)
+            return True
+
+        if low > stop:
+            old_stop = stop
+            state["stop"] = low
+
+            print("")
+            print("PAPER LONG TRAILING STOP UPDATED")
+            print(f"Old Stop: {old_stop:.2f}")
+            print(f"New Stop: {state['stop']:.2f}")
+
+        show_paper_position(state, close)
+        print("PAPER LONG: HOLD")
+        return True
+
+    # SHORT trailing stop:
+    # move the stop downward using the completed candle high.
+    if side == "SHORT":
+
+        if high >= stop:
+            pnl = (entry - stop) * amount
+
+            state["paper_pnl"] += pnl
+            state["trades"] += 1
+
+            if pnl >= 0:
+                state["wins"] += 1
+            else:
+                state["losses"] += 1
+
+            print("")
+            print("PAPER SHORT TRAILING STOP HIT")
+            print(f"Exit: {stop:.2f}")
+            print(f"P/L: ${pnl:.4f}")
+
+            clear_position(state)
+            save_state(state)
+            return True
+
+        if high < stop:
+            old_stop = stop
+            state["stop"] = high
+
+            print("")
+            print("PAPER SHORT TRAILING STOP UPDATED")
+            print(f"Old Stop: {old_stop:.2f}")
+            print(f"New Stop: {state['stop']:.2f}")
+
+        show_paper_position(state, close)
+        print("PAPER SHORT: HOLD")
+        return True
+
+    raise RuntimeError(
+        f"SAFETY BLOCK: unsupported paper position side: {side!r}"
+    )
+
+def prepare_live_long(entry, stop, target, amount):
+    """Prepare live LONG parameters without submitting an order."""
+    if LIVE_ORDERS_ENABLED is not True:
+        print("")
+        print("LIVE EXECUTION: DISABLED")
+        print("No live order submitted.")
+        return None
+
+    return {
+        "symbol": SYMBOL,
+        "side": "buy",
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "amount": amount
+    }
+
+
+def submit_live_long_entry(entry, amount):
+    """Submit a guarded LONG limit entry and return the Kraken order."""
+    if LIVE_ORDERS_ENABLED is not True:
+        print("")
+        print("LIVE EXECUTION: DISABLED")
+        print("No live entry order submitted.")
+        return None
 
     if entry <= 0:
-        raise ValueError(
-            "BTNL entry price must be positive."
-        )
+        raise ValueError("Live entry price must be positive.")
 
     if amount <= 0:
-        raise ValueError(
-            "BTNL entry amount must be positive."
+        raise ValueError("Live entry amount must be positive.")
+
+    exchange.load_markets()
+
+    price = float(
+        exchange.price_to_precision(
+            SYMBOL,
+            entry
+        )
+    )
+
+    quantity = float(
+        exchange.amount_to_precision(
+            SYMBOL,
+            amount
+        )
+    )
+
+    if price <= 0:
+        raise ValueError("Formatted entry price is invalid.")
+
+    if quantity <= 0:
+        raise ValueError("Formatted entry quantity is invalid.")
+
+    order = exchange.create_order(
+        SYMBOL,
+        "limit",
+        "buy",
+        quantity,
+        price
+    )
+
+    if not order:
+        raise RuntimeError(
+            "Kraken returned no order response."
         )
 
-    # Kraken Bitnomial BTC/USD rules:
-    # quantity: 8 decimal places
-    # price: 0.1 USD tick size
-    order_quantity = float(f"{amount:.8f}")
-    limit_price = round(float(entry), 1)
+    order_id = order.get("id")
 
-    if order_quantity <= 0:
-        raise ValueError(
-            "Formatted BTNL entry quantity is invalid."
-        )
-
-    if limit_price <= 0:
-        raise ValueError(
-            "Formatted BTNL entry price is invalid."
+    if not order_id:
+        raise RuntimeError(
+            "Kraken order response did not contain an order ID."
         )
 
     return {
-        "method": "add_order",
-        "params": {
-            "order_type": "limit",
-            "side": side,
-            "order_qty": order_quantity,
-            "symbol": MARGIN_SYMBOL,
-            "limit_price": limit_price,
-            "margin": True,
-            "cl_ord_id": "E-" + os.urandom(6).hex(),
-            "validate": True
+        "order_id": order_id,
+        "symbol": SYMBOL,
+        "side": "buy",
+        "type": "limit",
+        "price": price,
+        "amount": quantity,
+        "raw": order
+    }
+
+
+def build_bracket_plan(entry, stop, target, amount):
+    """Build a safe LONG bracket plan without submitting an order."""
+    if LIVE_ORDERS_ENABLED is not True:
+        return None
+
+    if entry <= 0 or stop <= 0 or target <= 0:
+        raise ValueError("Entry, stop, and target must be positive.")
+
+    if stop >= entry:
+        raise ValueError("LONG stop must be below entry.")
+
+    if target <= entry:
+        raise ValueError("LONG target must be above entry.")
+
+    if amount <= 0:
+        raise ValueError("Order amount must be positive.")
+
+    return {
+        "symbol": SYMBOL,
+        "side": "buy",
+        "amount": amount,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "protection": {
+            "stop_loss": {
+                "ordertype": "stop-loss",
+                "price": stop
+            },
+            "take_profit": {
+                "ordertype": "take-profit",
+                "price": target
+            }
         }
     }
 
 
-def submit_live_short_entry(entry, amount):
-    """Submit a guarded SHORT BTNL margin limit entry."""
-    if LIVE_ORDERS_ENABLED is not True:
-        print("")
-        print("LIVE EXECUTION: DISABLED")
-        print("No live SHORT entry order submitted.")
-        return None
-
-    request = build_kraken_v2_margin_entry_request(
-        "sell",
-        entry,
-        amount
-    )
-
-    params = request["params"]
-
-    # This is the LIVE entry path.
-    params["validate"] = False
-
-    response = exchange.privatePostGetWebSocketsToken()
-    token = response.get("result", {}).get("token")
-
-    if not token:
-        raise RuntimeError(
-            "Kraken WebSocket authentication token was not received."
-        )
-
-    params["token"] = token
-
-    ws = websocket.create_connection(
-        "wss://ws-auth.kraken.com/v2",
-        timeout=10
-    )
-
-    try:
-        ws.send(json.dumps({
-            "method": "subscribe",
-            "params": {
-                "channel": "executions",
-                "snap_orders": False,
-                "snap_trades": False,
-                "token": token
-            }
-        }))
-
-        subscription_confirmed = False
-
-        for _ in range(5):
-            message = json.loads(ws.recv())
-
-            if message.get("method") == "subscribe":
-                if message.get("success") is not True:
-                    raise RuntimeError(
-                        "Kraken authenticated WebSocket subscription failed."
-                    )
-
-                subscription_confirmed = True
-                break
-
-        if not subscription_confirmed:
-            raise RuntimeError(
-                "Kraken authenticated WebSocket subscription "
-                "was not confirmed."
-            )
-
-        ws.send(json.dumps({
-            "method": "add_order",
-            "params": params
-        }))
-
-        for _ in range(5):
-            message = json.loads(ws.recv())
-
-            if message.get("method") == "add_order":
-                if message.get("success") is not True:
-                    raise RuntimeError(
-                        "Kraken rejected the BTNL SHORT entry: "
-                        + str(message)
-                    )
-
-                result = message.get("result", {})
-                order_id = result.get("order_id")
-
-                if not order_id:
-                    raise RuntimeError(
-                        "Kraken SHORT entry response did not contain "
-                        "an order ID."
-                    )
-
-                return {
-                    "order_id": order_id,
-                    "symbol": MARGIN_SYMBOL,
-                    "side": "sell",
-                    "type": "limit",
-                    "price": params["limit_price"],
-                    "amount": params["order_qty"],
-                    "raw": message
-                }
-
-        raise RuntimeError(
-            "Kraken SHORT entry response was not received."
-        )
-
-    finally:
-        ws.close()
-
-
-def submit_live_long_entry(entry, amount):
-    """Submit a guarded LONG BTNL margin limit entry."""
-    if LIVE_ORDERS_ENABLED is not True:
-        print("")
-        print("LIVE EXECUTION: DISABLED")
-        print("No live LONG entry order submitted.")
-        return None
-
-    request = build_kraken_v2_margin_entry_request(
-        "buy",
-        entry,
-        amount
-    )
-
-    params = request["params"]
-
-    # This is the LIVE entry path.
-    params["validate"] = False
-
-    response = exchange.privatePostGetWebSocketsToken()
-    token = response.get("result", {}).get("token")
-
-    if not token:
-        raise RuntimeError(
-            "Kraken WebSocket authentication token was not received."
-        )
-
-    params["token"] = token
-
-    ws = websocket.create_connection(
-        "wss://ws-auth.kraken.com/v2",
-        timeout=10
-    )
-
-    try:
-        ws.send(json.dumps({
-            "method": "subscribe",
-            "params": {
-                "channel": "executions",
-                "snap_orders": False,
-                "snap_trades": False,
-                "token": token
-            }
-        }))
-
-        subscription_confirmed = False
-
-        for _ in range(5):
-            message = json.loads(ws.recv())
-
-            if message.get("method") == "subscribe":
-                if message.get("success") is not True:
-                    raise RuntimeError(
-                        "Kraken authenticated WebSocket subscription failed."
-                    )
-
-                subscription_confirmed = True
-                break
-
-        if not subscription_confirmed:
-            raise RuntimeError(
-                "Kraken authenticated WebSocket subscription "
-                "was not confirmed."
-            )
-
-        ws.send(json.dumps({
-            "method": "add_order",
-            "params": params
-        }))
-
-        for _ in range(5):
-            message = json.loads(ws.recv())
-
-            if message.get("method") == "add_order":
-                if message.get("success") is not True:
-                    raise RuntimeError(
-                        "Kraken rejected the BTNL LONG entry: "
-                        + str(message)
-                    )
-
-                result = message.get("result", {})
-                order_id = result.get("order_id")
-
-                if not order_id:
-                    raise RuntimeError(
-                        "Kraken LONG entry response did not contain "
-                        "an order ID."
-                    )
-
-                return {
-                    "order_id": order_id,
-                    "symbol": MARGIN_SYMBOL,
-                    "side": "buy",
-                    "type": "limit",
-                    "price": params["limit_price"],
-                    "amount": params["order_qty"],
-                    "raw": message
-                }
-
-        raise RuntimeError(
-            "Kraken LONG entry response was not received."
-        )
-
-    finally:
-        ws.close()
-
-
 def recover_live_position(state):
-    """Verify an existing live position and its native trailing-stop."""
-
+    """Verify an existing live position after a restart without placing orders."""
     if not state.get("active"):
         return {
             "status": "NO_ACTIVE_POSITION",
@@ -2361,8 +1874,11 @@ def recover_live_position(state):
     required = (
         "entry_order_id",
         "stop_order_id",
+        "target_order_id",
         "side",
         "entry",
+        "stop",
+        "target",
         "amount",
     )
 
@@ -2373,10 +1889,10 @@ def recover_live_position(state):
                 "reason": f"Missing required state field: {field}"
             }
 
-    if state.get("side") not in ("LONG", "SHORT"):
+    if state.get("side") != "LONG":
         return {
             "status": "RECOVERY_HALTED",
-            "reason": "Invalid live position side."
+            "reason": "Only LONG recovery is currently supported."
         }
 
     try:
@@ -2389,13 +1905,9 @@ def recover_live_position(state):
                 "Entry order has unexpected symbol."
             )
 
-        expected_entry_side = (
-            "sell" if state["side"] == "SHORT" else "buy"
-        )
-
-        if entry.get("side") != expected_entry_side:
+        if entry.get("side") != "buy":
             raise RuntimeError(
-                f"Entry order side does not match {state['side']} position."
+                "Entry order is not a buy order."
             )
 
         if entry.get("type") != "limit":
@@ -2430,74 +1942,29 @@ def recover_live_position(state):
                 "Entry average fill price does not match saved entry."
             )
 
-        trailing_order = get_authenticated_order_history_v1(
-            state["stop_order_id"]
+        protection = verify_protection_pair(
+            state["stop_order_id"],
+            state["target_order_id"],
+            state["amount"],
+            state["stop"],
+            state["target"],
+            state["entry_order_id"]
         )
 
-        if not trailing_order:
+        if protection.get("status") != "VERIFIED":
             return {
                 "status": "RECOVERY_HALTED",
-                "reason": "Trailing-stop order could not be verified."
-            }
-
-        trailing_status = trailing_order.get("status")
-
-        if trailing_status not in ("open", "pending"):
-            return {
-                "status": "RECOVERY_HALTED",
-                "reason": (
-                    "Trailing-stop order has unexpected status: "
-                    f"{trailing_status}"
+                "reason": protection.get(
+                    "reason",
+                    "Protection verification failed."
                 ),
-                "trailing_stop": trailing_order,
-            }
-
-        expected_protection_side = (
-            "sell" if state["side"] == "LONG"
-            else "buy"
-        )
-
-        actual_protection_side = (
-            trailing_order.get("descr", {})
-            .get("type")
-        )
-
-        if actual_protection_side != expected_protection_side:
-            return {
-                "status": "RECOVERY_HALTED",
-                "reason": (
-                    "Trailing-stop side mismatch. "
-                    f"Expected {expected_protection_side}, "
-                    f"got {actual_protection_side}."
-                ),
-                "trailing_stop": trailing_order,
-            }
-
-        trailing_quantity = float(
-            trailing_order.get("vol", 0) or 0
-        )
-
-        if abs(trailing_quantity - float(state["amount"])) > 1e-8:
-            return {
-                "status": "RECOVERY_HALTED",
-                "reason": (
-                    "Trailing-stop quantity mismatch. "
-                    f"Expected {state['amount']}, "
-                    f"got {trailing_quantity}."
-                ),
-                "trailing_stop": trailing_order,
+                "protection": protection,
             }
 
         return {
             "status": "RECOVERY_VERIFIED",
             "entry": entry,
-            "trailing_stop": trailing_order,
-            "protection": {
-                "status": "VERIFIED",
-                "type": "TRAILING_STOP",
-                "order_id": state["stop_order_id"],
-            },
-            "state": state,
+            "protection": protection
         }
 
     except Exception as exc:
@@ -2506,43 +1973,6 @@ def recover_live_position(state):
             "reason": str(exc)
         }
 
-
-def detect_liquidity_sweeps(candle, previous):
-    """
-    Detect simple liquidity sweeps using the completed candle
-    and the immediately preceding completed candle.
-
-    Bullish sweep:
-        current low trades below previous low,
-        then current close recovers back above previous low.
-
-    Bearish sweep:
-        current high trades above previous high,
-        then current close falls back below previous high.
-    """
-    current_high = candle[2]
-    current_low = candle[3]
-    current_close = candle[4]
-
-    previous_high = previous[2]
-    previous_low = previous[3]
-
-    bullish_sweep = (
-        current_low < previous_low
-        and current_close > previous_low
-    )
-
-    bearish_sweep = (
-        current_high > previous_high
-        and current_close < previous_high
-    )
-
-    return {
-        "bullish": bullish_sweep,
-        "bearish": bearish_sweep,
-        "swept_low": previous_low,
-        "swept_high": previous_high
-    }
 
 def run_once():
     state = load_state()
@@ -2591,13 +2021,24 @@ def run_once():
 
         print("")
         print("LIVE PROTECTION: VERIFIED")
-        print("Native 0.25% trailing-stop protection is confirmed.")
+        print("Stop-loss and take-profit are confirmed.")
         print("PROTECTION-PENDING: CLEARED")
 
     # =========================
     # LIVE POSITION RECOVERY GATE
     # =========================
     if state.get("active") and state.get("live_mode") is True:
+
+        if state.get("side") != "LONG":
+            print("")
+            print("LIVE RECOVERY HALTED")
+            print(
+                f"Reason: Invalid live position side: "
+                f"{state.get('side')!r}. LONG is required."
+            )
+            print("NO LIVE MANAGEMENT PERMITTED")
+            print("NO NEW ORDERS WILL BE SUBMITTED")
+            return
 
         recovery = recover_live_position(state)
 
@@ -2616,7 +2057,7 @@ def run_once():
 
         print("")
         print("LIVE RECOVERY: VERIFIED")
-        print("Entry and native trailing-stop protection confirmed.")
+        print("Entry and protection orders confirmed.")
 
     # =========================
     # WAITING LIVE ENTRY GATE
@@ -2624,7 +2065,6 @@ def run_once():
     if (
         state.get("live_mode") is True
         and not state.get("active")
-        and state.get("entry_pending") is True
         and state.get("entry_order_id")
     ):
 
@@ -2700,7 +2140,7 @@ def run_once():
                 save_state(state)
 
                 print("LIVE PROTECTION: VERIFIED")
-                print("Native 0.25% trailing-stop protection is confirmed.")
+                print("Stop-loss and take-profit are confirmed.")
                 print("PROTECTION-PENDING: CLEARED")
                 print("NO NEW ORDERS WILL BE SUBMITTED")
                 return
@@ -2798,7 +2238,7 @@ def run_once():
     )
 
     # =========================
-    # BEELZEBUB V2 LONG + SHORT SETUP
+    # BEELZEBUB V2 LONG SETUP
     # =========================
 
     long_trend = (
@@ -2829,55 +2269,10 @@ def run_once():
         and long_volume
     )
 
-    short_trend = (
-        sma20 < sma50
-    )
-
-    short_price = (
-        close < vwap
-    )
-
-    short_rsi = (
-        rsi14 < RSI_THRESHOLD
-    )
-
-    short_breakout = (
-        close < previous[3]
-    )
-
-    short_volume = (
-        volumes[-1] > required_volume
-    )
-
-    short_signal = (
-        short_trend
-        and short_price
-        and short_rsi
-        and short_breakout
-        and short_volume
-    )
-
-    # =========================
-    # LIQUIDITY SWEEP DETECTION
-    # =========================
-
-    liquidity_sweeps = detect_liquidity_sweeps(
-        candle,
-        previous
-    )
-
-    bullish_liquidity_sweep = (
-        liquidity_sweeps["bullish"]
-    )
-
-    bearish_liquidity_sweep = (
-        liquidity_sweeps["bearish"]
-    )
-
     print("")
     print("=" * 55)
     print(
-        f"{BOT_NAME} — LONG + SHORT PAPER MONITOR"
+        f"{BOT_NAME} — LONG ONLY PAPER MONITOR"
     )
     print(
         f"{SYMBOL} — 15 MINUTES"
@@ -2925,29 +2320,6 @@ def run_once():
     )
 
     print("")
-    print("LIQUIDITY SWEEP DETECTION")
-
-    print(
-        f"Bullish Sweep: "
-        f"{bullish_liquidity_sweep}"
-    )
-
-    print(
-        f"Bearish Sweep: "
-        f"{bearish_liquidity_sweep}"
-    )
-
-    print(
-        f"Swept Previous Low: "
-        f"{liquidity_sweeps['swept_low']:.2f}"
-    )
-
-    print(
-        f"Swept Previous High: "
-        f"{liquidity_sweeps['swept_high']:.2f}"
-    )
-
-    print("")
     print("BEELZEBUB V2 LONG CONDITIONS")
 
     print(
@@ -2976,48 +2348,14 @@ def run_once():
         f"{long_volume}"
     )
 
-    print("")
-    print("BEELZEBUB V2 SHORT CONDITIONS")
-
-    print(
-        f"Trend SMA20 < SMA50: "
-        f"{short_trend}"
-    )
-
-    print(
-        f"Price < VWAP: "
-        f"{short_price}"
-    )
-
-    print(
-        f"RSI < {RSI_THRESHOLD}: "
-        f"{short_rsi}"
-    )
-
-    print(
-        f"Breakdown < Previous Low: "
-        f"{short_breakout}"
-    )
-
-    print(
-        f"Volume > "
-        f"{VOLUME_MULTIPLIER:.1f}x Average: "
-        f"{short_volume}"
-    )
-
     # Existing LIVE position gets priority.
     if state.get("active") and state.get("live_mode") is True:
 
         print("")
         print("LIVE POSITION: VERIFIED")
-        print(f"LIVE SIDE: {state.get('side')}")
-        print(f"Entry: {state.get('entry')}")
-        print(f"Stop: {state.get('stop')}")
-        print(f"Target: {state.get('target')}")
         print("PAPER MANAGEMENT: BLOCKED")
-        print("LIVE MANAGEMENT: PROTECTED")
-        print("Exchange-side native trailing-stop protection remains authoritative.")
-        print("NO ADDITIONAL LIVE ORDERS WILL BE SUBMITTED")
+        print("LIVE MANAGEMENT: NOT YET ENABLED")
+        print("NO NEW ORDERS WILL BE SUBMITTED")
 
     # Existing PAPER position gets priority.
     elif state.get("active"):
@@ -3027,34 +2365,36 @@ def run_once():
             candle
         )
 
-    elif long_signal or short_signal:
+    elif long_signal:
 
-        if long_signal:
+        entry = close
 
-            side = "LONG"
-            entry = close
-            stop = previous[3]
-            risk_distance = entry - stop
+        # Stop = previous completed
+        # candle's low.
+        stop = previous[3]
 
-        else:
-
-            side = "SHORT"
-            entry = close
-            stop = previous[2]
-            risk_distance = stop - entry
+        risk_distance = (
+            entry - stop
+        )
 
         if risk_distance <= 0:
 
             print("")
             print(
-                f"SIGNAL: {side} BLOCKED"
+                "SIGNAL: LONG BLOCKED"
             )
+
             print(
-                "Initial stop is not "
-                "on the correct side of entry."
+                "Previous low is not "
+                "below entry."
             )
 
         else:
+
+            target = (
+                entry
+                + (risk_distance * R_MULTIPLE)
+            )
 
             amount = position_size(
                 entry,
@@ -3065,8 +2405,9 @@ def run_once():
 
                 print("")
                 print(
-                    f"SIGNAL: {side} BLOCKED"
+                    "SIGNAL: LONG BLOCKED"
                 )
+
                 print(
                     "Position size is zero."
                 )
@@ -3074,119 +2415,86 @@ def run_once():
             else:
 
                 # =========================
-                # LIVE ENTRY
+                # LIVE LONG ENTRY
                 # =========================
                 if LIVE_ORDERS_ENABLED is True:
 
-                    print("")
-                    print(
-                        f"LIVE {side} SIGNAL CONFIRMED"
-                    )
-                    print(
-                        f"Entry: {entry}"
-                    )
-                    print(
-                        f"Stop: {stop}"
-                    )
-                    print(
-                        f"Risk distance: {risk_distance}"
-                    )
-                    print(
-                        f"Amount: {amount}"
-                    )
+                    try:
 
-                    if side == "LONG":
-                        live_entry = submit_live_long_entry(
-                            entry,
-                            amount
-                        )
-                    else:
-                        live_entry = submit_live_short_entry(
+                        live_order = submit_live_long_entry(
                             entry,
                             amount
                         )
 
-                    if not live_entry:
+                        if not live_order:
+                            raise RuntimeError(
+                                "Live entry submission returned no order."
+                            )
+
+                        state = set_waiting_for_fill(
+                            state,
+                            live_order["order_id"],
+                            live_order["amount"],
+                            stop
+                        )
+
+                        save_state(state)
+
                         print("")
+                        print("SIGNAL: LONG")
                         print(
-                            "LIVE ENTRY FAILED"
+                            f"Requested Entry: "
+                            f"{live_order['price']:.2f}"
                         )
                         print(
-                            "No live position state was created."
+                            f"Stop: "
+                            f"{stop:.2f}"
                         )
+                        print(
+                            f"Position Size: "
+                            f"{live_order['amount']:.8f} BTC"
+                        )
+                        print(
+                            f"Entry Order ID: "
+                            f"{live_order['order_id']}"
+                        )
+                        print("")
+                        print("LIVE ENTRY: SUBMITTED")
+                        print("LIVE ENTRY: WAITING FOR FILL")
+                        print("PROTECTION: NOT YET ACTIVE")
+                        print("NO NEW ORDERS WILL BE SUBMITTED")
+
                         return
 
-                    entry_order_id = live_entry["order_id"]
+                    except Exception as exc:
 
-                    target = (
-                        entry + (
-                            risk_distance * R_MULTIPLE
-                        )
-                        if side == "LONG"
-                        else entry - (
-                            risk_distance * R_MULTIPLE
-                        )
-                    )
+                        print("")
+                        print("LIVE ENTRY: HALTED")
+                        print(f"Reason: {exc}")
+                        print("NO POSITION ACTIVATED")
+                        print("NO NEW ORDERS WILL BE SUBMITTED")
 
-                    state = set_waiting_for_fill(
-                        state,
-                        entry_order_id,
-                        amount,
-                        stop,
-                        side=side
-                    )
-
-                    state["entry"] = entry
-                    state["target"] = target
-                    state["entry_time"] = candle_time
-                    state["live_mode"] = True
-                    state["protection_pending"] = True
-                    state["stop_order_id"] = None
-                    state["target_order_id"] = None
-
-                    save_state(state)
-
-                    print("")
-                    print(
-                        f"LIVE {side} ENTRY SUBMITTED"
-                    )
-                    print(
-                        f"Entry order ID: {entry_order_id}"
-                    )
-                    print(
-                        "Waiting for confirmed fill."
-                    )
-                    print(
-                        "Protection will not be submitted "
-                        "until the entry is confirmed filled."
-                    )
-
-                    return
+                        return
 
                 # =========================
-                # PAPER POSITION
+                # PAPER LONG
                 # =========================
 
                 state["active"] = True
-                state["side"] = side
+                state["side"] = "LONG"
                 state["entry"] = entry
                 state["stop"] = stop
-                state["target"] = None
+                state["target"] = target
                 state["amount"] = amount
                 state["entry_time"] = (
                     candle_time
                 )
-                state["live_mode"] = False
-                state["protection_pending"] = False
-                state["entry_order_id"] = None
-                state["stop_order_id"] = None
-                state["target_order_id"] = None
 
                 save_state(state)
 
                 print("")
                 print(
-                    f"SIGNAL: {side}"
+                    "SIGNAL: LONG"
                 )
 
                 print(
@@ -3194,8 +2502,12 @@ def run_once():
                 )
 
                 print(
-                    f"Initial Trailing Stop: "
-                    f"{stop:.2f}"
+                    f"Stop: {stop:.2f}"
+                )
+
+                print(
+                    f"Target 2R: "
+                    f"{target:.2f}"
                 )
 
                 print(
@@ -3214,11 +2526,7 @@ def run_once():
                 )
 
                 print(
-                    f"PAPER {side} EXECUTED"
-                )
-
-                print(
-                    "TRAILING STOP: ACTIVE"
+                    "PAPER LONG EXECUTED"
                 )
 
                 print(
@@ -3232,7 +2540,7 @@ def run_once():
 
         print(
             "No confirmed "
-            "BEELZEBUB V2 LONG or SHORT setup."
+            "BEELZEBUB V2 LONG setup."
         )
 
         print(
@@ -3260,8 +2568,6 @@ def run_once():
         f"Losses: "
         f"{state['losses']}"
     )
-
-
 
 
 def main():

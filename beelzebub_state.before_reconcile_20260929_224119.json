@@ -1,0 +1,20 @@
+{
+  "active": true,
+  "side": "SHORT",
+  "entry": 83489.5,
+  "stop": 83591.5,
+  "target": 83285.5,
+  "amount": 0.00010794,
+  "entry_time": "2026-09-29 21:15:00",
+  "pending_stop": 83591.5,
+  "entry_order_id": "OORMOJ-ZK26Z-3KNLYS",
+  "stop_order_id": "OTTVOS-GF2AK-EGM4OL",
+  "target_order_id": "OVQ23N-JTMB7-TXSK4M",
+  "protection_pending": false,
+  "live_mode": true,
+  "paper_pnl": 0.0,
+  "trades": 0,
+  "wins": 0,
+  "losses": 0,
+  "entry_type": "NORMAL_SHORT"
+}
